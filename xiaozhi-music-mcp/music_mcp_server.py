@@ -13,6 +13,7 @@ import hmac
 import hashlib
 import json
 import re
+from urllib.parse import urljoin, urlparse
 
 import httpx
 from fastmcp import FastMCP, Context
@@ -44,6 +45,28 @@ playback_state = {
     "is_playing": False,
     "volume": 50,
 }
+
+# 搜索结果缓存：song_id -> 搜索结果 dict（包含带签名的 lrc URL 等）
+# 解决大模型不传 lrc 参数时，resolve_music_url 也能自动拿到歌词链接
+_search_result_cache: dict[str, dict] = {}
+
+
+def _normalize_music_url(url: str) -> str:
+    """把相对地址补全为完整 URL，避免请求时报协议缺失错误。"""
+    normalized = (url or "").strip()
+    if not normalized:
+        return ""
+
+    parsed = urlparse(normalized)
+    if parsed.scheme in ("http", "https"):
+        return normalized
+
+    # 兼容 //host/path 这种协议相对地址，默认按 HTTPS 处理。
+    if normalized.startswith("//"):
+        return f"https:{normalized}"
+
+    # 兼容 /api?... 或 api?... 这种相对路径，基于 MUSIC_API_BASE_URL 补全。
+    return urljoin(MUSIC_API_BASE_URL, normalized)
 
 
 def _build_music_params(server: str, req_type: str, req_id: str) -> dict[str, str]:
@@ -78,16 +101,24 @@ async def _search_api(query: str, limit: int = 10) -> list[dict]:
             data = resp.json()
             results = []
             for item in data[:limit]:
-                results.append(
-                    {
-                        "id": item.get("id") or item.get("url", ""),
-                        "name": item.get("title", "未知歌曲"),
-                        "artist": item.get("author", "未知歌手"),
-                        "url": item.get("url", ""),
-                        "pic": item.get("pic", ""),
-                        "lrc": item.get("lrc", ""),
-                    }
-                )
+                raw_url = str(item.get("url", "")).strip()
+                normalized_url = _normalize_music_url(raw_url)
+                raw_lrc = str(item.get("lrc", "")).strip()
+                # 把 lrc 相对路径补全为完整 URL
+                normalized_lrc = _normalize_music_url(raw_lrc) if raw_lrc else ""
+                song_entry = {
+                    "id": item.get("id") or normalized_url,
+                    "name": item.get("title", "未知歌曲"),
+                    "artist": item.get("author", "未知歌手"),
+                    "url": normalized_url,
+                    "pic": item.get("pic", ""),
+                    "lrc": normalized_lrc,
+                }
+                results.append(song_entry)
+                # 缓存搜索结果，后续 resolve_music_url 可以自动取到 lrc
+                song_id_str = str(song_entry["id"])
+                if song_id_str:
+                    _search_result_cache[song_id_str] = song_entry
             return results
     except Exception as e:
         logger.error("搜索音乐出错: %s", e)
@@ -206,13 +237,14 @@ async def _resolve_final_url(url: str) -> str:
     很多 CDN 的播放链接有访问次数或流量限制，
     GET 会"消耗"一次完整下载配额，导致 ESP32 后续只能读到部分数据。
     """
-    if not url:
+    normalized_url = _normalize_music_url(url)
+    if not normalized_url:
         return ""
 
     # 优先 HEAD：只获取响应头和重定向后的最终 URL，不下载文件内容。
     try:
         async with httpx.AsyncClient(follow_redirects=True) as client:
-            resp = await client.head(url, timeout=15.0)
+            resp = await client.head(normalized_url, timeout=15.0)
             if resp.status_code in (200, 206):
                 return str(resp.url)
     except Exception as e:
@@ -222,13 +254,13 @@ async def _resolve_final_url(url: str) -> str:
     # 只读取响应头就关闭连接，不下载文件体。
     try:
         async with httpx.AsyncClient(follow_redirects=True) as client:
-            async with client.stream("GET", url, timeout=15.0) as resp:
+            async with client.stream("GET", normalized_url, timeout=15.0) as resp:
                 if resp.status_code == 200:
                     return str(resp.url)
     except Exception as e:
         logger.warning("GET(stream)解析重定向失败: %s", e)
 
-    return url
+    return normalized_url
 
 
 def _build_lyric_url(song_id: str | None, lrc: str = "") -> str:
@@ -300,7 +332,7 @@ async def resolve_music_url(
     if ctx:
         await ctx.report_progress(10, total=100, message="开始解析播放请求")
 
-    source_url = url.strip()
+    source_url = _normalize_music_url(url)
     if not source_url and resolved_song_id:
         if ctx:
             await ctx.report_progress(25, total=100, message="根据歌曲ID查询播放地址")
@@ -312,8 +344,27 @@ async def resolve_music_url(
         await ctx.report_progress(55, total=100, message="解析最终可播放直链")
     final_url = await _resolve_final_url(source_url)
 
-    # 构造歌词 URL，ESP32 设备端会自行拉取歌词，无需大模型透传完整文本
-    lyric_url = _build_lyric_url(resolved_song_id, lrc)
+    # 构造歌词 URL：
+    # 1. 优先用传入的 lrc 参数
+    # 2. 其次从搜索缓存中取（大模型常常不传 lrc）
+    # 3. 再其次用 song_id 自行构造（需要签名 token）
+    # 4. 最后兜底：直接拉取歌词文本
+    effective_lrc = lrc
+    cache_key = str(resolved_song_id) if resolved_song_id else ""
+    if not effective_lrc and cache_key and cache_key in _search_result_cache:
+        cached = _search_result_cache[cache_key]
+        effective_lrc = cached.get("lrc", "")
+        if effective_lrc:
+            logger.info("从搜索缓存获取到歌词 URL: %s", effective_lrc[:80])
+
+    lyric_url = _build_lyric_url(resolved_song_id, effective_lrc)
+    lyric_text = ""
+    if not lyric_url and resolved_song_id:
+        if ctx:
+            await ctx.report_progress(70, total=100, message="正在获取歌词...")
+        lyric_text = await _fetch_song_lyric(resolved_song_id)
+        if lyric_text:
+            logger.info("通过 _fetch_song_lyric 直接获取到歌词文本（%d 字符）", len(lyric_text))
 
     if ctx:
         await ctx.report_progress(80, total=100, message="歌词链接已生成")
@@ -331,27 +382,35 @@ async def resolve_music_url(
     if ctx:
         await ctx.report_progress(100, total=100, message="直链解析完成")
 
+    # 构造传给设备端的参数
+    next_args: dict[str, str] = {
+        "url": final_url,
+        "title": song_name,
+        "artist": artist,
+    }
+    if lyric_url:
+        next_args["lyric_url"] = lyric_url
+    elif lyric_text:
+        # lyric_url 构造失败但直接拿到了歌词文本，作为 fallback 传给设备
+        next_args["lyric"] = lyric_text
+
+    has_lyric = bool(lyric_url or lyric_text)
     result = {
         "song_name": song_name,
         "artist": artist,
         "final_url": final_url,
         "lyric_url": lyric_url,
-        "has_lyric": bool(lyric_url),
+        "has_lyric": has_lyric,
         # 明确告诉大模型下一步调用设备端工具，参数已准备好直接透传。
-        # lyric_url 很短（约 100 字符），大模型传递可靠性远高于完整歌词文本。
         "next_tool": "self.music.play_url",
-        "next_arguments": {
-            "url": final_url,
-            "title": song_name,
-            "artist": artist,
-            "lyric_url": lyric_url,
-        },
+        "next_arguments": next_args,
     }
     logger.info(
-        "已解析歌曲: %s - %s, lyric_url=%s",
+        "已解析歌曲: %s - %s, lyric_url=%s, has_lyric_text=%s",
         song_name,
         artist,
         lyric_url,
+        bool(lyric_text),
     )
     return json.dumps(result, ensure_ascii=False)
 
