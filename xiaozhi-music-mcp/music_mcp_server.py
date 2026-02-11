@@ -13,7 +13,7 @@ import hmac
 import hashlib
 import json
 import re
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, parse_qs
 
 import httpx
 from fastmcp import FastMCP, Context
@@ -51,8 +51,24 @@ playback_state = {
 _search_result_cache: dict[str, dict] = {}
 
 
+def _get_api_origin() -> str:
+    """从 MUSIC_API_BASE_URL 提取 origin（scheme + host），用于拼接相对路径。
+
+    例如 MUSIC_API_BASE_URL = "https://api.i-meto.com/meting/api"
+    返回 "https://api.i-meto.com"
+    """
+    parsed = urlparse(MUSIC_API_BASE_URL)
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+
 def _normalize_music_url(url: str) -> str:
-    """把相对地址补全为完整 URL，避免请求时报协议缺失错误。"""
+    """把相对地址补全为完整 URL，避免请求时报协议缺失错误。
+
+    API 返回的 url/pic/lrc 通常是不带域名的相对路径，如：
+      /api?server=netease&type=url&id=93213&auth=xxx
+    需要拼接上 origin 变成：
+      https://api.i-meto.com/api?server=netease&type=url&id=93213&auth=xxx
+    """
     normalized = (url or "").strip()
     if not normalized:
         return ""
@@ -65,8 +81,26 @@ def _normalize_music_url(url: str) -> str:
     if normalized.startswith("//"):
         return f"https:{normalized}"
 
-    # 兼容 /api?... 或 api?... 这种相对路径，基于 MUSIC_API_BASE_URL 补全。
+    # 以 / 开头的绝对路径，直接拼接 origin（不使用 urljoin，避免受 BASE_URL 路径影响）。
+    if normalized.startswith("/"):
+        return f"{_get_api_origin()}{normalized}"
+
+    # 其他相对路径，基于 MUSIC_API_BASE_URL 补全。
     return urljoin(MUSIC_API_BASE_URL, normalized)
+
+
+def _extract_id_from_url(url: str) -> str:
+    """尝试从 API 返回的相对路径中提取歌曲 ID（查询参数 id）。
+
+    API 返回的 url 通常是 /api?server=netease&type=url&id=93213&auth=xxx，
+    其中 id=93213 就是歌曲的数字 ID，后续查播放地址、歌词等都需要它。
+    """
+    try:
+        parsed = urlparse(url)
+        ids = parse_qs(parsed.query).get("id", [])
+        return ids[0] if ids else ""
+    except Exception:
+        return ""
 
 
 def _build_music_params(server: str, req_type: str, req_id: str) -> dict[str, str]:
@@ -101,17 +135,27 @@ async def _search_api(query: str, limit: int = 10) -> list[dict]:
             data = resp.json()
             results = []
             for item in data[:limit]:
+                # 统一补全所有 URL 字段（API 返回的都是不带域名的相对路径）
                 raw_url = str(item.get("url", "")).strip()
-                normalized_url = _normalize_music_url(raw_url)
+                raw_pic = str(item.get("pic", "")).strip()
                 raw_lrc = str(item.get("lrc", "")).strip()
-                # 把 lrc 相对路径补全为完整 URL
-                normalized_lrc = _normalize_music_url(raw_lrc) if raw_lrc else ""
+
+                normalized_url = _normalize_music_url(raw_url)
+                normalized_pic = _normalize_music_url(raw_pic)
+                normalized_lrc = _normalize_music_url(raw_lrc)
+
+                # 提取歌曲 ID：优先用 API 返回的 id 字段，
+                # 否则从 url 查询参数中解析（如 /api?...&id=93213&...）
+                song_id = str(item.get("id", "")).strip()
+                if not song_id:
+                    song_id = _extract_id_from_url(raw_url) or normalized_url
+
                 song_entry = {
-                    "id": item.get("id") or normalized_url,
+                    "id": song_id,
                     "name": item.get("title", "未知歌曲"),
                     "artist": item.get("author", "未知歌手"),
                     "url": normalized_url,
-                    "pic": item.get("pic", ""),
+                    "pic": normalized_pic,
                     "lrc": normalized_lrc,
                 }
                 results.append(song_entry)
@@ -369,14 +413,29 @@ async def resolve_music_url(
     if ctx:
         await ctx.report_progress(80, total=100, message="歌词链接已生成")
 
-    playback_state["current_song"] = {
-        "id": resolved_song_id or source_url,
+    current_song = {
+        "id": str(resolved_song_id or source_url or final_url),
         "name": song_name,
         "artist": artist,
         "url": final_url,
         "source_url": source_url,
         "lyric_url": lyric_url,
     }
+    playback_state["current_song"] = current_song
+    # 自动加入播放列表：同一首歌按 id/url 去重，避免重复堆积
+    playlist = playback_state["playlist"]
+    existing_idx = -1
+    for i, song in enumerate(playlist):
+        same_id = str(song.get("id", "")) == current_song["id"]
+        same_url = bool(current_song["url"]) and song.get("url", "") == current_song["url"]
+        if same_id or same_url:
+            existing_idx = i
+            break
+    if existing_idx >= 0:
+        playlist[existing_idx].update(current_song)
+    else:
+        playlist.append(dict(current_song))
+
     playback_state["is_playing"] = False
 
     if ctx:
@@ -463,12 +522,20 @@ async def next_song() -> str:
     if not playlist:
         return "播放列表为空，无法切换到下一首"
 
+    if len(playlist) == 1:
+        return "播放列表只有一首歌，无法切换到下一首"
+
     next_index = 0
     if current:
+        current_index = -1
         for i, song in enumerate(playlist):
             if song["id"] == current["id"]:
-                next_index = (i + 1) % len(playlist)
+                current_index = i
                 break
+        if current_index >= 0:
+            if current_index >= len(playlist) - 1:
+                return "已经是最后一首"
+            next_index = current_index + 1
 
     next_s = playlist[next_index]
     playback_state["current_song"] = next_s
@@ -484,12 +551,20 @@ async def previous_song() -> str:
     if not playlist:
         return "播放列表为空，无法切换到上一首"
 
-    prev_index = len(playlist) - 1
+    if len(playlist) == 1:
+        return "播放列表只有一首歌，无法切换到上一首"
+
+    prev_index = 0
     if current:
+        current_index = -1
         for i, song in enumerate(playlist):
             if song["id"] == current["id"]:
-                prev_index = (i - 1) % len(playlist)
+                current_index = i
                 break
+        if current_index > 0:
+            prev_index = current_index - 1
+        elif current_index == 0:
+            return "已经是第一首"
 
     prev_s = playlist[prev_index]
     playback_state["current_song"] = prev_s
